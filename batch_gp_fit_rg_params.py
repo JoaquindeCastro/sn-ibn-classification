@@ -11,6 +11,11 @@ from lc_param_GP import (
     check_candidates, check_candidates_color, get_LC,
 )
 
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+#from dustmaps.sfd import SFDQuery
+import sncosmo
+
 import glob
 from tqdm import tqdm
 import re
@@ -21,8 +26,26 @@ client = Alerce()
 
 from concurrent.futures import ProcessPoolExecutor
 
+from astroquery.irsa_dust import IrsaDust
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 
-# added this recently
+ROOT_DIR = r'C:\Users\jgmad\Research\Ibn'
+DATA_DIR =  os.path.join(ROOT_DIR, "data")
+PLOT_DIR =  os.path.join(ROOT_DIR, "plots")
+#PHOT_DIR = os.path.join(DATA_DIR, "ztf_ibn")
+folders = ['ZTFBTS','ibn_papers']
+PHOT_DIRS = [os.path.join(DATA_DIR, f) for f in folders]
+
+PLOT = False
+VERBOSE = False
+SNT = 4
+ZP = 27.5
+DAYS_AFTER = None
+DAYS_FROM_PEAK = None # only used if DAYS_AFTER=0
+IBN = False
+UNLABELED = False
+
 EXTRAPOLATE_RISE_TIME_IF_NO_DECLINE = True
 RISE_SLOPE_FIXED_WINDOW_DAYS = 10 
 MAX_EXTRAP_DAYS_AFTER_LAST = 30 
@@ -123,27 +146,9 @@ Expects data to be in the following format
 dateobs,mjd,mag,dmag,source,filter,magtype
 '''
 
-
-ROOT_DIR = r'C:\Users\jgmad\Research\Ibn'
-DATA_DIR =  os.path.join(ROOT_DIR, "data")
-PLOT_DIR =  os.path.join(ROOT_DIR, "plots")
-#PHOT_DIR = os.path.join(DATA_DIR, "ztf_ibn")
-folders = ['ZTFBTS','ibn_papers']
-PHOT_DIRS = [os.path.join(DATA_DIR, f) for f in folders]
-
 phot_files = []
 for d in PHOT_DIRS:
     phot_files.extend(glob.glob(os.path.join(d, "*")))
-
-test = ['ZTF18aaaonon','ZTF18aaaooqj']
-
-PLOT = True
-SNT = 4
-ZP = 27.5
-DAYS_AFTER = 0
-DAYS_FROM_PEAK = 0 # only used if DAYS_AFTER=0
-IBN = False
-UNLABELED = False
 
 # Get label/type
 summary_file, = glob.glob(os.path.join(DATA_DIR, "ZTFBTS_summary.csv"))
@@ -158,8 +163,9 @@ summary_data['redshift'] = pd.to_numeric(summary_data['redshift'], errors='coerc
 no_type_ztfids = summary_data[summary_data['type'].isna()].index.tolist()
 
 Ibns = list(summary_data[summary_data['type'] == 'SN Ibn'].index)
-
-phot_files = [f for f in phot_files if any(x in f for x in Ibns)]
+sn_to_exclude = ['ZTF18abwkrbl']
+phot_files = [f for f in phot_files if all(x not in f for x in sn_to_exclude)]
+#phot_files = [f for f in phot_files if any(x in f for x in ['2010al','2006jc'])]
 
 RUN_NAME = f'SN{"_Ibn" if IBN else ""}{"_UNLABELED" if UNLABELED else ""}'
 today_mjd = Time.now().mjd
@@ -181,14 +187,46 @@ lambda_eff = {'g': 4770, 'r': 6231}
 
 nodets = []
 
+def ebv_from_radec(ra_str_or_deg, dec_str_or_deg, sexagesimal=True):
+    if sexagesimal:
+        c = SkyCoord(ra_str_or_deg + " " + dec_str_or_deg, unit=(u.hourangle, u.deg), frame='icrs')
+    else:
+        c = SkyCoord(float(ra_str_or_deg), float(dec_str_or_deg), unit=(u.deg, u.deg), frame='icrs')
+    ebv_sfd = float(sfd(c))            # SFD98 E(B−V) to infinity
+    ebv_sf11 = 0.86 * ebv_sfd          # SF11 recalibration factor
+    return ebv_sf11
+
+
+def ebv_from_radec_irsa(ra_str, dec_str):
+    c = SkyCoord(f"{ra_str} {dec_str}", unit=(u.hourangle, u.deg))
+    # IRSA expects decimal degrees
+    tbl = IrsaDust.get_query_table(f"{c.ra.deg} {c.dec.deg}", section="ebv")
+    ebv_sfd = float(tbl["ext SandF mean"][0])  # SFD98 E(B−V)
+    return 0.86 * ebv_sfd                      # SF11 rescale
+
+prefixes = ['SN','AT', 'TD']
+def strip_name(name):
+    name = name.replace(' ','')
+    try:
+        if name == '-':
+            return None
+        elif "".join(name[:2]) in prefixes:
+            return name[2:]
+        else:
+            return name
+    except:
+        if VERBOSE:
+            print(name)
+        return name
+
 def process(file):
     filename = os.path.basename(file)
     supernova_name = filename.split("_")[0]
     supernova_name = safe_filename(supernova_name)
     supernova_name = supernova_name.split('.')[0]
-    if IBN: 
+    '''if IBN: 
         if supernova_name not in Ibns:
-            return None,None,None,None
+            return None,None,None,None'''
     if UNLABELED:
         if supernova_name not in no_type_ztfids:
             return None, None,None,None
@@ -225,21 +263,58 @@ def process(file):
         #data['magtype'] = np.where(1.086 / data['dmag'] > 4, 1, -1)
 
     except Exception as e:
-        print(f'now processing {supernova_name} because of {e}')
+        if VERBOSE:
+            print(f'now processing {supernova_name} because of {e}')
+        mask = data['filter'] == 'R'
+        data.loc[mask, 'mag'] = data.loc[mask, 'mag'] + 0.21
+        data.loc[mask, 'filter'] = 'r'
 
     data['mjd'] = pd.to_numeric(data['mjd'], errors='coerce')
+    summary_data['IAUID_stripped'] = summary_data['IAUID'].astype(str).apply(strip_name)
+    stripped = strip_name(supernova_name)
 
     if supernova_name in summary_data.index:
-        A_V = float(summary_data.at[supernova_name, 'A_V'])
+        try:
+            A_V = float(summary_data.at[supernova_name, 'A_V'])
+        except:
+            print(supernova_name)
         ebv = float(A_V / R_V)
 
         for f in ['g', 'r']:
             filt_mask = data['filter'] == f
             if filt_mask.any():
-                A_lambda = fitzpatrick99(np.full(filt_mask.sum(), lambda_eff[f]), ebv * R_V, r_v=R_V)
+                A_lambda = fitzpatrick99(np.full(filt_mask.sum(), lambda_eff[f]), A_V, R_V)
                 data.loc[filt_mask, 'mag'] -= A_lambda
+        z = float(summary_data.at[supernova_name,'redshift'])
+        if pd.notna(z) and z != 0:
+            data['mjd'] = (data['mjd'] - data['mjd'].min()) / (1. + z) + data['mjd'].min()
 
-        z = float(summary_data.at[supernova_name, 'redshift'])
+
+    elif stripped in summary_data['IAUID_stripped'].values:
+        A_V = float(summary_data.loc[summary_data['IAUID_stripped'] == stripped, 'A_V'].iloc[0])
+        ebv = float(A_V / R_V)
+
+        for f in ['g', 'r']:
+            filt_mask = data['filter'] == f
+            if filt_mask.any():
+                if pd.isna(A_V):                     # only apply if A_V is null
+                    ebv = ebv_from_radec_irsa(summary_data.loc[summary_data['IAUID_stripped'] == stripped, 'RA'].iloc[0],
+                                        summary_data.loc[summary_data['IAUID_stripped'] == stripped, 'Dec'].iloc[0],
+                                        )
+                    A_V = R_V * ebv
+
+                    A_lambda = fitzpatrick99(
+                        np.full(filt_mask.sum(), lambda_eff[f]),
+                        A_V,
+                        R_V
+                    )
+                    data.loc[filt_mask, 'mag'] -= A_lambda
+                    if VERBOSE:
+                        print(f'did RA DEC for {supernova_name}')
+                else:
+                    A_lambda = fitzpatrick99(np.full(filt_mask.sum(), lambda_eff[f]), A_V, R_V)
+                    data.loc[filt_mask, 'mag'] -= A_lambda
+        z = float(summary_data.loc[summary_data['IAUID_stripped'] == stripped, 'redshift'].iloc[0])
         if pd.notna(z) and z != 0:
             data['mjd'] = (data['mjd'] - data['mjd'].min()) / (1. + z) + data['mjd'].min()
 
@@ -250,22 +325,27 @@ def process(file):
         data['mag'] = data['mag'] -  mu
         print('after')
         print(data['mag'])'''
-        # above does not work very sad, just including it in classifier
-
+        # above does not work, just including it in classifier
+        print(A_V)
     else:
-        print(f"Warning: {supernova_name} not in summary_data, skipping extinction and redshift correction.")
+        print(f"Warning: {stripped} not in summary_data, skipping extinction and redshift correction.")
 
     data = data.dropna(subset=['mjd']) # remove nan values
     data = data[~( (data['magtype']==1) & (data['mag'].isna() | data['dmag'].isna()) )]
     data = data[~((data['magtype'] == 1) & (data['dmag'] <= 0))]
     #print(data[~(data['magtype'] == 1)])
 
-
-    if len(data) <= 3:
-        return None,None,None,None
-    if len(data[(data['magtype'] == 1) & (data['filter'] == 'r')]) < 4 or len(data[(data['magtype'] == 1) & (data['filter'] == 'g')]) < 4:
-        return None,None,None,None
-        
+    '''if len(data) <= 3:
+        if VERBOSE:
+            print(f'Not enough data for {supernova_name}')
+        return None,None,None,None'''
+    if supernova_name not in ['2006jc','2010al']:
+        if len(data[(data['magtype'] == 1) & (data['filter'] == 'r')]) < 4 or len(data[(data['magtype'] == 1) & (data['filter'] == 'g')]) < 4:
+            if VERBOSE:
+                print(f'Not enough data in r or g for {supernova_name}')
+            return None,None,None,None
+    else:
+        data['filter'] = data['filter'].replace({'rp': 'r'})
 
     if DAYS_AFTER:
         if DAYS_AFTER>0:
@@ -390,6 +470,8 @@ if __name__ == "__main__":
             data_list_g[name] = g_result
             data_list_rg[name] = rg_result  # NEW
 
+    print(data_list_rg)
+
 
     log('Merging r and g bands...')
 
@@ -397,6 +479,8 @@ if __name__ == "__main__":
 
     # Get all unique supernova names across both filters
     SN = set(data_list_r.keys()).union(data_list_g.keys()).union(data_list_rg.keys())
+
+    print(SN)
 
     for key in tqdm(SN):
         row = {'oid': key}
